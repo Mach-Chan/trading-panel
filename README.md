@@ -1,122 +1,91 @@
 # Trading Panel
 
-在 Claude Code 上复刻 [TradingAgents](https://github.com/TauricResearch/TradingAgents)
-（Apache-2.0，arXiv 2412.20138）的多智能体投研编排——**不需要任何 API key，不需要 Python 环境，
-不需要容器**，全部跑在 Claude Code 订阅上。
+把 [TradingAgents](https://github.com/TauricResearch/TradingAgents)（Apache-2.0，arXiv 2412.20138）
+接到本地 Claude Code 订阅上运行——**原版一行代码不改，不需要任何 LLM API key**。
 
 > ⚠️ 本项目产出的是**可审查的研究过程**，不是投资建议，也不执行任何交易操作。
 
 ---
 
-## 这是什么
+## 这个项目做了什么
 
-原版 TradingAgents 用 LangGraph 把投研拆成 12 个 AI 角色，让它们分工、辩论、层层把关。
-本项目保留同一套编排范式，把执行层换成 Claude Code：
+原版 TradingAgents 用 LangGraph 把投研拆成 12 个 AI 角色分工辩论，质量很高，
+但它只会说一种语言：**OpenAI 协议的 HTTP API**。要跑它就得有 OpenAI / DeepSeek 之类的 key，按 token 付费。
 
-| 原版（Python + LangGraph） | 本项目（Claude Code） |
-|---|---|
-| `StateGraph` 状态图 | Workflow 脚本（JavaScript） |
-| `add_node(agent)` | `agent(提示词, {schema})` |
-| `add_edge` 固定边 | 脚本里的执行顺序 |
-| `add_conditional_edges` 条件边 | `for` 循环与 `if` |
-| `max_debate_rounds` 计数器 | `ROUNDS` 常量（硬封顶 1–3） |
-| 共享 state 字典 | 阶段之间传递返回值 |
-| Pydantic 结构化输出 | JSON Schema 校验（不合规自动重试） |
-| checkpoint 断点续跑 | `resumeFromRunId` |
-| OpenAI / DeepSeek API + key | **Claude Code 订阅，零 key** |
-| Alpha Vantage 行情 key | 联网检索取证 |
-
-## 流程
+本项目写了一个**适配器（adapter）**：把本地 `claude -p` 包装成 OpenAI 兼容接口，
+于是原版把它当成一个普通的模型服务，正常驱动它自己的状态图。
 
 ```
-                 ┌── 技术面分析师 ──┐
-   标的 + 基准日 ─┼── 基本面分析师 ──┼─→ 证据包
-                 ├── 新闻面分析师 ──┤        （四路并发）
-                 └── 情绪面分析师 ──┘
-                          ↓
-            看多研究员 ⇄ 看空研究员   （轮流交锋，轮数硬封顶）
-                          ↓
-                   研究经理裁决        （独立角色，逐条回应双方）
-                          ↓
-                   交易员出方案        （方向 + 分批 + 止损 + 仓位）
-                          ↓
-        激进派 ∥ 保守派 → 中性派       （两派并发挑刺，中性派专职抓矛盾）
-                          ↓
-                  组合经理拍板         （评级 + 执行框架 + 数据盲区）
-                          ↓
-                    决策台账 → 日后回填复盘
+原版 TradingAgents  ──OpenAI 协议──▶  proxy/claude_proxy.py  ──▶  claude -p（你的订阅）
+   （零改动）                            （本项目唯一自研代码）
 ```
 
-## 相对原版的三处改进
+自研部分只有 `proxy/claude_proxy.py` 一个文件，约 300 行。数据层、防未来数据泄漏、
+记忆、反思、回测——全都是原版的，完整保留。
 
-1. **数据盲区是强制字段。**
-   每份分析报告的 schema 里 `数据盲区` 必填，最终裁决书必须汇总并说明"结论因此在哪些方面不可靠"。
-   起因：原版实跑时 StockTwits 返回 403、Reddit 限流 429，情绪面实际是瞎的，
-   但报告只字未提，照样输出了自信满满的裁决书。**静默降级是这类系统最大的失真来源。**
+## 适配器解决的三个问题
 
-2. **风控三方改为「两派并发 + 中性派收口」。**
-   原版是三方轮流转圈发言，后发言者会被前面带节奏。这里让激进派与保守派**独立并行**审查，
-   互不可见，然后中性派拿到两份完整意见**专职找自相矛盾**——
-   例如"一边反对宽止损、一边又要求把止损贴着现价设，在高波动标的上几乎必然误伤"。
-   这类矛盾在原版实跑中是最高价值的产出，现在被制度化要求，而不是碰运气。
+1. **纯模型化**
+   Claude Code 默认是个 agent，会自己去搜网、读文件。但工具必须由 TradingAgents 执行，
+   所以代理会剥掉它的系统提示词和全部内置工具，让它退化成一个纯粹的大模型。
 
-3. **全程结构化输出。**
-   每个角色都有 JSON Schema 约束，组合经理被 schema 逼着必须同时填
-   "为何不更激进"与"为何不更保守"——两边都要交代，堵住和稀泥。
+2. **工具调用（function calling）双向翻译**
+   原版用 LangChain 给模型绑定工具，并检查返回里的 `tool_calls` 字段来驱动状态图。
+   `claude -p` 只吐纯文本，所以代理去程把工具 schema 渲染进系统提示词并规定严格格式，
+   回程再把模型的回复解析回 OpenAI 的 `tool_calls` 结构。
+
+3. **严格 JSON 输出**
+   部分调用方（如某些报告生成器）用极严格的解析器：JSON 之外出现任何字符就判失败。
+   代理一方面在系统提示词里加了输出纪律，另一方面在回程做兜底清洗——
+   只在确实能剥出一个完整合法 JSON 时才动手，剥不出来就原样返回，不做破坏性猜测。
 
 ## 用法
 
-### 完整版（Workflow，12 个角色，确定性编排）
-
-在 Claude Code 里说"用 trading-panel 工作流分析 RKLB"，或直接调用：
-
-```
-Workflow({
-  name: 'trading-panel',
-  args: {
-    ticker: 'RKLB',
-    name: 'Rocket Lab',
-    asOf: '2026-08-17',
-    rounds: 1,                    // 1–3，越大吵得越深，成本成倍
-    stance: '纯研究（未持仓）'      // 或 '已持仓，考虑加减' / '空仓，考虑建仓'
-  }
-})
+```bash
+./run.sh                    # 打开原版交互式看板，自己选股票和分析师
+./run.sh RKLB               # 直接分析某只票，输出完整报告
+./run.sh RKLB 2026-05-01    # 时间旅行：以那天的视角分析（原版的防未来数据泄漏机制有效）
 ```
 
-### 轻量版（Skill，同一套流程，模型自主编排）
+`run.sh` 会自动检查代理在不在、不在就拉起来，然后加载 `.env` 跑原版。
 
-直接说"分析一下 RKLB"或"交易评审团"即可触发。适合快速看一眼，
-不需要完整 12 角色的场合。
+配置在 `.env`：把 `TRADINGAGENTS_LLM_PROVIDER` 设为 `openai`、
+`TRADINGAGENTS_LLM_BACKEND_URL` 指向本地代理即可。行情数据仍需 Alpha Vantage key（免费档够用）。
 
 ## 目录结构
 
 ```
 trading-panel/
-├── README.md                       本文件
-├── workflows/trading-panel.js      完整版编排脚本（软链到 ~/.claude/workflows/）
-├── skills/trading-panel/SKILL.md   轻量版技能（软链到 ~/.claude/skills/）
-└── docs/                           设计笔记与实跑记录
+├── proxy/claude_proxy.py    唯一自研代码：OpenAI 兼容代理
+├── upstream/TradingAgents/  原版全量克隆，保持原样（gitignore，需自行 clone 并装依赖）
+├── run.sh / analyze.py      启动脚本
+├── workflows/               另一条路线，见下
+└── skills/                  另一条路线，见下
 ```
 
-代码在本项目里，通过软链接被 Claude Code 发现——**这里是唯一的真实来源**，
-改这里即时生效，也方便用 git 管理版本。
+## 关于 `workflows/` 与 `skills/`
 
-## 决策台账
+这两个目录是**另一条路线**：不接原版，而是在 Claude Code 里用 subagent 直接重写
+那套编排逻辑（四路分析师 → 多空辩论 → 研究经理 → 交易员 → 三方风控 → 组合经理）。
 
-分析结果写入 `~/Documents/ObsidianVault/笔记/学习/trading/`：
-每次分析一个文件，外加一份 `LEDGER.md` 索引和一份 `LESSONS.md` 教训集。
+**必须说清楚它不是复刻。** 按代码量算，原版 7967 行 Python 里数据层占 37%、
+角色与提示词占 30%、编排图占 15%；这条路线只重写了编排的**拓扑结构**（366 行），
+数据层完全没有。最重要的缺失是：**原版在代码里强制过滤基准日之后的数据，
+而这条路线只在提示词里要求模型"不要引用未来信息"——靠自觉不靠机制**。
 
-放在 Obsidian 而不是本项目里，是因为台账是**要反复读、要和其他笔记互链**的知识，
-而这里放的是代码。想改到本项目内也可以，改 SKILL.md 里的路径即可。
+后果很实际：**这条路线做不了可信的历史回测**，跑出的漂亮成绩单可能只是在背答案。
+它适合"今天怎么看"的当下分析，不适合验证判断力。
 
-**回填复盘**：说"复盘持仓判断"或 `/trading-panel 复盘`，
-会读出所有"待验证"条目、对照真实走势、更新状态、把教训写进 LESSONS.md。
-分析同一标的时会先读历史判断——这是原版 `TradingMemoryLog` 的等价物，
-让判断跨次连续、可追责。
+要做回测，用 `./run.sh <代码> <历史日期>` 走原版。
 
 ## 已知限制
 
-- **情绪面数据经常取不到**：机构持仓、做空比例、社区热度公开渠道有限，报告会如实标注。
+- **情绪面数据经常取不到**：机构持仓、做空比例、社区热度的公开渠道有限，报告会如实标注。
 - **结论随模型与数据变化**：同一只票不同时间、不同轮数跑出的结论可能不同。这是特性不是缺陷——
   本项目的价值在于论证过程可审查，而不是给出唯一正确答案。
-- **不做实时行情**：分析基于检索到的公开数据，可能滞后。不适合日内交易场景。
+- **不做实时行情**：分析基于公开数据源，可能滞后，不适合日内交易场景。
+
+## 致谢
+
+编排范式与全部投研逻辑来自 [TauricResearch/TradingAgents](https://github.com/TauricResearch/TradingAgents)（Apache-2.0）。
+本项目只提供一个运行时适配层。
