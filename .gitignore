@@ -2,6 +2,8 @@ upstream/
 .venv/
 .env
 *.log
+reports/
 proxy/proxy.out
 proxy/proxy-calls.log
+proxy/e2e-test.log
 .DS_Store

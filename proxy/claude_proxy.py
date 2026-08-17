@@ -109,6 +109,19 @@ TOOL_PROTOCOL = """\
 """
 
 
+STRICT_OUTPUT_RULE = """
+
+# 输出纪律（非常重要）
+
+调用方是程序，不是人。因此：
+- 如果上面的指令要求你返回 JSON、或给出了 JSON 结构模板，你的回复**必须是且只是那一个 JSON 对象本身**。
+  不要写任何前言、解释、总结或收尾语；不要套 markdown 代码围栏；不要输出多个 JSON 块。
+  调用方的解析器极其严格：JSON 之外出现任何字符都会导致整次调用失败。
+- 如果指令要求某种特定格式（表格、固定小节、纯文本），严格照它的格式产出，不要添加自己的格式。
+- 不要说"好的""我来分析一下"这类话，直接给结果。
+"""
+
+
 def render_tools(tools: list[dict] | None) -> str:
     if not tools:
         return ""
@@ -163,6 +176,7 @@ def flatten(messages: list[dict], tools: list[dict] | None) -> tuple[str, str]:
     if not system:
         system = "You are a helpful assistant. Answer the user directly and completely."
     system += render_tools(tools)
+    system += STRICT_OUTPUT_RULE
 
     user = "\n\n".join(convo) if convo else "（无内容）"
     if any(m.get("role") == "tool" for m in messages):
@@ -260,6 +274,41 @@ def parse_tool_calls(text: str) -> tuple[str | None, list[dict] | None]:
     return text, None
 
 
+def unwrap_json(text: str) -> str:
+    """把"解释文字 + JSON"或"```json 围栏"清洗成裸 JSON。
+
+    很多程序（如 daily_stock_analysis 的个股分析）用极严格的解析器：
+    JSON 之外出现任何字符就判为失败。提示词纪律不总管得住模型，
+    所以这里做第二道保险——只在确实能剥出一个完整 JSON 对象时才动手。
+    """
+    if not text:
+        return text
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        try:
+            json.loads(stripped)
+            return stripped  # 本来就干净，不动
+        except json.JSONDecodeError:
+            pass
+
+    # 收集候选：围栏里的内容，以及第一个 { 到最后一个 } 之间的内容
+    candidates: list[str] = [m.group(1).strip() for m in FENCE.finditer(text)]
+    first, last = stripped.find("{"), stripped.rfind("}")
+    if first != -1 and last > first:
+        candidates.append(stripped[first : last + 1])
+
+    for cand in candidates:
+        if not cand.startswith("{"):
+            continue
+        try:
+            json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        return cand  # 剥出了一个合法 JSON 对象
+
+    return text  # 剥不出来就原样返回，不做破坏性猜测
+
+
 def usage_of(data: dict) -> dict:
     u = data.get("usage", {}) or {}
     pt = (
@@ -314,6 +363,14 @@ async def chat(request: Request):
         )
 
     content, tool_calls = parse_tool_calls(data.get("result", ""))
+    if content and not tool_calls:
+        wants_json = (body.get("response_format") or {}).get("type") == "json_object"
+        looks_like_json = "{" in content and "}" in content and not content.strip().startswith("{")
+        if wants_json or looks_like_json:
+            cleaned = unwrap_json(content)
+            if cleaned is not content and cleaned != content:
+                log(f"  ⤷ 已剥离解释文字，返回纯 JSON（{len(content)} → {len(cleaned)} 字符）")
+                content = cleaned
     if tool_calls:
         log(f"← 工具调用 {[c['function']['name'] for c in tool_calls]} | {data['_elapsed']:.1f}s")
     else:
